@@ -1,0 +1,75 @@
+=== 修订版可复现分析（方案B: 溞浓度修正 + PVC=0.8 µm, 编码全唯一）===
+统一数据集: 144 行（train 115 / test 29）
+Fold_EC50 范围: 0.000 - 0.587
+
+--- 1) 主模型性能 ---
+   model  train_R2  train_MAE  test_R2  test_MAE  n_train  n_test
+baseline    0.9881     0.5446   0.9401    1.1221      115      29
+enhanced    0.9874     0.5902   0.9420    1.3357      115      29
+
+--- 2) 50 seeds 重复 5 折 CV（train 内, seed 等权口径）---
+ cv_R2_mean  cv_R2_sd    cv_R2_CI  cv_MAE_mean  cv_MAE_sd   cv_MAE_CI  fold_between_sd               model
+      0.908     0.014 0.876-0.931        1.471      0.094 1.318-1.660            0.043 baseline(Fold-EC50)
+      0.901     0.016 0.861-0.922        1.571      0.088 1.446-1.774            0.048 enhanced(Fold-EC50)
+      0.829     0.037 0.737-0.872        2.039      0.155 1.799-2.340            0.093       baseline(raw)
+
+--- 3) 物种特异性模型（各物种独立, 80/20 + 50 seeds 5折CV）---
+   species  n  test_R2  test_MAE  cv50_R2_mean  cv50_R2_sd  cv50_R2_CI
+C.vulgaris 72    0.727     1.894         0.758       0.069 0.568-0.833
+   D.magna 72    0.940     1.497         0.762       0.162 0.226-0.873
+
+--- 4) 分组 CV（pooled R² / MAE, 逐组明细）---
+LOPTO[Fold-EC50]: pooled R²=0.905, MAE=1.604
+    [{'group': 'PS-NH2', 'R2': 0.918, 'MAE': 1.641, 'n': 24}, {'group': 'PS', 'R2': 0.901, 'MAE': 1.531, 'n': 24}, {'group': 'PS-COOH', 'R2': 0.942, 'MAE': 1.317, 'n': 24}, {'group': 'PVC', 'R2': 0.879, 'MAE': 2.393, 'n': 24}, {'group': 'PE', 'R2': 0.954, 'MAE': 0.984, 'n': 24}, {'group': 'PP', 'R2': 0.83, 'MAE': 1.757, 'n': 24}]
+LOSeries(species x plastic, 12folds)[Fold-EC50]: pooled R²=0.908, MAE=1.538
+    [{'group': '藻_PS-NH2', 'R2': 0.838, 'MAE': 1.78, 'n': 12}, {'group': '藻_PS', 'R2': 0.635, 'MAE': 2.241, 'n': 12}, {'group': '藻_PS-COOH', 'R2': 0.783, 'MAE': 0.971, 'n': 12}, {'group': '藻_PVC', 'R2': 0.921, 'MAE': 1.994, 'n': 12}, {'group': '藻_PE', 'R2': 0.917, 'MAE': 1.345, 'n': 12}, {'group': '藻_PP', 'R2': 0.874, 'MAE': 1.467, 'n': 12}, {'group': '溞_PS-NH2', 'R2': 0.863, 'MAE': 2.235, 'n': 12}, {'group': '溞_PS', 'R2': 0.965, 'MAE': 1.229, 'n': 12}, {'group': '溞_PS-COOH', 'R2': 0.954, 'MAE': 1.494, 'n': 12}, {'group': '溞_PVC', 'R2': 0.99, 'MAE': 0.769, 'n': 12}, {'group': '溞_PE', 'R2': 0.978, 'MAE': 0.844, 'n': 12}, {'group': '溞_PP', 'R2': 0.776, 'MAE': 2.083, 'n': 12}]
+LOSO[Fold-EC50]: pooled R²=0.854, MAE=1.949
+    [{'group': 0, 'R2': 0.839, 'MAE': 1.816, 'n': 72}, {'group': 1, 'R2': 0.861, 'MAE': 2.083, 'n': 72}]
+LOPTO[raw]: pooled R²=0.842, MAE=2.059
+    [{'group': 'PS-NH2', 'R2': 0.752, 'MAE': 3.012, 'n': 24}, {'group': 'PS', 'R2': 0.952, 'MAE': 1.209, 'n': 24}, {'group': 'PS-COOH', 'R2': 0.765, 'MAE': 2.018, 'n': 24}, {'group': 'PVC', 'R2': 0.812, 'MAE': 3.136, 'n': 24}, {'group': 'PE', 'R2': 0.924, 'MAE': 1.301, 'n': 24}, {'group': 'PP', 'R2': 0.871, 'MAE': 1.675, 'n': 24}]
+LOSeries(species x plastic, 12folds)[raw]: pooled R²=0.837, MAE=2.060
+    [{'group': '藻_PS-NH2', 'R2': 0.589, 'MAE': 2.977, 'n': 12}, {'group': '藻_PS', 'R2': 0.936, 'MAE': 1.132, 'n': 12}, {'group': '藻_PS-COOH', 'R2': -3.109, 'MAE': 3.429, 'n': 12}, {'group': '藻_PVC', 'R2': 0.792, 'MAE': 3.233, 'n': 12}, {'group': '藻_PE', 'R2': 0.899, 'MAE': 1.583, 'n': 12}, {'group': '藻_PP', 'R2': 0.847, 'MAE': 2.079, 'n': 12}, {'group': '溞_PS-NH2', 'R2': 0.9, 'MAE': 2.006, 'n': 12}, {'group': '溞_PS', 'R2': 0.953, 'MAE': 1.232, 'n': 12}, {'group': '溞_PS-COOH', 'R2': 0.928, 'MAE': 1.639, 'n': 12}, {'group': '溞_PVC', 'R2': 0.801, 'MAE': 2.688, 'n': 12}, {'group': '溞_PE', 'R2': 0.903, 'MAE': 1.385, 'n': 12}, {'group': '溞_PP', 'R2': 0.906, 'MAE': 1.345, 'n': 12}]
+LOSO[raw]: pooled R²=-0.253, MAE=6.158
+    [{'group': 0, 'R2': -0.864, 'MAE': 6.877, 'n': 72}, {'group': 1, 'R2': 0.077, 'MAE': 5.44, 'n': 72}]
+LOSO[enhanced]: pooled R²=0.490, MAE=4.031
+    [{'group': 0, 'R2': 0.127, 'MAE': 4.583, 'n': 72}, {'group': 1, 'R2': 0.691, 'MAE': 3.478, 'n': 72}]
+
+--- 5) 泄漏诊断（5 折 CV 单特征）---
+              feature  cv_R2_mean  cv_R2_sd
+       Fold_EC50_only      0.5287    0.1680
+RawConcentration_only      0.6528    0.1305
+
+--- 6) 预测区间（LOSeries 12 折下, 1000 树 RF 2.5-97.5 分位）---
+    input  n_heldout  coverage_95pct  mean_width_pct
+Fold-EC50        144           0.868           6.412
+ enhanced        144           0.917           7.365
+
+--- 7) EC20（全局基线模型预测 vs 实测插值）---
+   species plastic  time_h  EC20_meas_mgL  EC20_pred_mgL  rel_dev_pct                                   flag
+C.vulgaris      PS      72         57.970         42.049      -27.464                           interpolated
+C.vulgaris     PVC      72        368.954        321.665      -12.817                           interpolated
+C.vulgaris      PE      72        489.282        430.254      -12.064                           interpolated
+   D.magna      PS      48          8.335          7.638       -8.363                           interpolated
+   D.magna     PVC      48         65.089         43.431      -33.275                           interpolated
+   D.magna      PE      48            NaN         57.574          NaN extrapolated (no measured point >=20%)
+
+--- 8) SHAP 重要性（mean|SHAP|, 训练集）---
+[baseline]
+  Fold_EC50       6.0625
+  Time_h          2.2204
+  Size_um         0.7126
+  Species         0.3137
+  SurfaceGroup    0.1057
+[enhanced]
+  Fold_EC50       5.2455
+  MDA             1.7555
+  Time_h          0.9581
+  SOD             0.3808
+  GSH             0.3330
+  Species         0.0931
+  Size_um         0.0586
+  SurfaceGroup    0.0313
+
+--- Size-SHAP 决策树切分（基线模型）---
+  节点深度0: Size_um <= 0.440 µm (n=115)
+  节点深度1: Size_um <= 3.900 µm (n=58)

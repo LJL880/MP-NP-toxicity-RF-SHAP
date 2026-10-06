@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+"""
+=====================================================================
+RF + IBR + SHAP 跨物种微/纳米塑料毒性归因 — 完整可复现分析（投稿版）
+=====================================================================
+论文: Machine-Learning Attribution of Micro/Nanoplastic Toxicity Using an
+      Integrated Biomarker Response Index: Size-Dominated Contributions of
+      Surface Functional Groups and Polymer Composition
+稿件号: EN-ART-07-2026-000594 (Environmental Science: Nano, Major Revision)
+
+输入:  SI_Dataset_unified.csv（统一建模数据集, 144 行, 与 SI 数据表一致）
+输出:  model_results_final.txt（完整结果）+ 若干结果 csv（同目录）
+
+【数据构建口径（与 SI 一致）】
+  * 物种: C. vulgaris（藻, Species=0）; D. magna（溞, Species=1）
+  * 材料表面基团编码（全唯一）:
+        PS=0, PVC=1, PS-COOH=2, PE=3, PP=4, PS-NH2=5
+  * 粒径(表征确认): PS/PS-COOH/PS-NH2=0.08 µm; PVC=0.8 µm; PE/PP=7.0 µm
+  * 剂量: Fold-EC50 = 暴露浓度 / 物种特异性 EC50
+        (藻: 72-h EC50; 溞: 48-h EC50; EC50 值见 SI Table S5)
+  * 溞亚致死浓度(修正为与实验记录/方法一致):
+        0.4 / 2 / 10 mg/L (NPs) 与 3 / 15 / 75 mg/L (MPs)
+  * 统一数据集: 6 材料 × 2 物种 × (0 + 3 浓度) × 3 时间 = 144 行
+  * 随机种子: 全脚本统一 seed=42（含 80/20 分层划分与超参数）
+
+【模型设置（与原稿一致）】
+  RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42)
+  基线特征: Fold_EC50, Size_um, SurfaceGroup, Time_h, Species
+  增强特征: 基线 + 共享氧化应激生物标志物 MDA, SOD, GSH
+
+【验证方案】
+  1) 主模型: 80/20 分层划分（Species 分层, seed=42）
+  2) 重复 5 折 CV: 50 个随机种子, 报告 seed 等权均值 ± SD 与 95% CI
+  3) 分组 CV（pooled R²）:
+        LOPTO(6 塑料) / LOSeries(物种×塑料, 12 折) / LOSO(2 物种)
+     同时报告 Fold-EC50 与 raw 浓度两种输入, 用于泄漏-泛化对照
+  4) 泄漏诊断: Fold-EC50 单特征 vs raw 单特征（5 折 CV R²）
+  5) 预测区间: LOSeries 下 1000 树 RF 的 2.5-97.5 分位
+  6) EC20: 全局基线模型 300 对数浓度点插值
+  7) SHAP: mean|SHAP| 重要性 + Size-SHAP 决策树切分
+
+运行环境: Python 3.7+, numpy, pandas, scikit-learn, shap (验证于 Python 3.7.8)
+=====================================================================
+"""
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.metrics import r2_score, mean_absolute_error
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CSV = os.path.join(HERE, 'SI_Dataset_unified.csv')
+
+RS = 42
+N_SEEDS = 50
+BASE_FEATS = ['Fold_EC50', 'Size_um', 'SurfaceGroup', 'Time_h', 'Species']
+RAW_FEATS = ['Concentration_mgL', 'Size_um', 'SurfaceGroup', 'Time_h', 'Species']
+ENH_FEATS = BASE_FEATS + ['MDA', 'SOD', 'GSH']
+SP_FEATS = ['Concentration_mgL', 'Size_um', 'SurfaceGroup', 'Time_h']
+
+# EC50（mg/L, SI Table S5）
+EC50_D = {
+    'C.vulgaris': {'PS-NH2': 120.3, 'PS-COOH': 733.4, 'PS': 198.0, 'PE': 1309.9, 'PP': 1395.7, 'PVC': 972.6},
+    'D.magna':   {'PS-NH2': 21.6,  'PS-COOH': 24.2,  'PS': 23.1,  'PE': 155.5,  'PP': 179.8,  'PVC': 127.7},
+}
+
+def rf(seed=RS):
+    return RandomForestRegressor(n_estimators=200, max_depth=8, random_state=seed)
+
+def mean_ci(x):
+    return np.mean(x), np.std(x), np.percentile(x, 2.5), np.percentile(x, 97.5)
+
+L = []
+def log(s=''):
+    L.append(str(s))
+
+# ------------------------------------------------------------------ 读取与划分
+df = pd.read_csv(CSV)
+y = df['Inhibition_pct']
+sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=RS)
+tr_idx, te_idx = next(sss.split(df, df['Species']))
+df_tr, df_te = df.iloc[tr_idx], df.iloc[te_idx]
+Xtr, Xte = df_tr, df_te
+ytr, yte = y.iloc[tr_idx], y.iloc[te_idx]
+pd.DataFrame({'split': ['train'] * len(tr_idx) + ['test'] * len(te_idx),
+              'idx': list(tr_idx) + list(te_idx)}).to_csv(
+    os.path.join(HERE, 'si_split_indices.csv'), index=False)
+
+log('=== 修订版可复现分析（方案B: 溞浓度修正 + PVC=0.8 µm, 编码全唯一）===')
+log(f'统一数据集: {len(df)} 行（train {len(tr_idx)} / test {len(te_idx)}）')
+log(f'Fold_EC50 范围: {df.Fold_EC50.min():.3f} - {df.Fold_EC50.max():.3f}')
+
+# ------------------------------------------------------------------ 1) 主模型
+def fit_eval(feats, Xtr_, Xte_):
+    m = rf().fit(Xtr_[feats], ytr)
+    return m, {
+        'train_R2': r2_score(ytr, m.predict(Xtr_[feats])),
+        'train_MAE': mean_absolute_error(ytr, m.predict(Xtr_[feats])),
+        'test_R2': r2_score(yte, m.predict(Xte_[feats])),
+        'test_MAE': mean_absolute_error(yte, m.predict(Xte_[feats])),
+        'n_train': len(ytr), 'n_test': len(yte),
+    }
+
+m_base, res_base = fit_eval(BASE_FEATS, Xtr, Xte)
+m_enh, res_enh = fit_eval(ENH_FEATS, Xtr, Xte)
+log('\n--- 1) 主模型性能 ---')
+log(pd.DataFrame([{'model': 'baseline', **res_base}, {'model': 'enhanced', **res_enh}]).round(4).to_string(index=False))
+pd.DataFrame([{'model': 'baseline', **res_base}, {'model': 'enhanced', **res_enh}]).to_csv(
+    os.path.join(HERE, 'results_main_final.csv'), index=False)
+
+# ------------------------------------------------------------------ 2) 50 seeds 重复 5 折 CV（seed 等权 + fold 间）
+def repeated_cv(feats, n_seeds=N_SEEDS):
+    per_seed_r2, per_seed_mae, all_fold_r2 = [], [], []
+    for seed in range(n_seeds):
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+        fr, fm = [], []
+        for a, b in skf.split(df[feats], df['Species']):
+            m = rf(seed).fit(df[feats].iloc[a], y.iloc[a])
+            p = m.predict(df[feats].iloc[b])
+            fr.append(r2_score(y.iloc[b], p)); fm.append(mean_absolute_error(y.iloc[b], p))
+        per_seed_r2.append(np.mean(fr)); per_seed_mae.append(np.mean(fm)); all_fold_r2.extend(fr)
+    r2m, r2s, r2lo, r2hi = mean_ci(np.array(per_seed_r2))
+    mam, mas, malo, mahi = mean_ci(np.array(per_seed_mae))
+    return dict(cv_R2_mean=r2m, cv_R2_sd=r2s, cv_R2_CI=f'{r2lo:.3f}-{r2hi:.3f}',
+                cv_MAE_mean=mam, cv_MAE_sd=mas, cv_MAE_CI=f'{malo:.3f}-{mahi:.3f}',
+                fold_between_sd=np.std(all_fold_r2))
+
+cv_rows = []
+for name, feats in [('baseline(Fold-EC50)', BASE_FEATS), ('enhanced(Fold-EC50)', ENH_FEATS), ('baseline(raw)', RAW_FEATS)]:
+    r = repeated_cv(feats)
+    r['model'] = name
+    cv_rows.append(r)
+log('\n--- 2) 50 seeds 重复 5 折 CV（train 内, seed 等权口径）---')
+log(pd.DataFrame(cv_rows).round(3).to_string(index=False))
+pd.DataFrame(cv_rows).to_csv(os.path.join(HERE, 'results_cv_final.csv'), index=False)
+
+# ------------------------------------------------------------------ 3) 物种特异性模型（藻/溞）
+sp_rows = []
+for sp_name, sp_code in [('C.vulgaris', 0), ('D.magna', 1)]:
+    sub = df[df['Species'] == sp_code].reset_index(drop=True)
+    Xs, ys = sub[SP_FEATS], sub['Inhibition_pct']
+    sss_sp = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=RS)
+    tr, te = next(sss_sp.split(Xs, sub['Plastic']))
+    m = rf().fit(Xs.iloc[tr], ys.iloc[tr])
+    per_seed = []
+    for seed in range(N_SEEDS):
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+        f = []
+        for a, b in skf.split(Xs, sub['Plastic']):
+            mm = rf(seed).fit(Xs.iloc[a], ys.iloc[a])
+            f.append(r2_score(ys.iloc[b], mm.predict(Xs.iloc[b])))
+        per_seed.append(np.mean(f))
+    r2m, r2s, r2lo, r2hi = mean_ci(np.array(per_seed))
+    sp_rows.append({'species': sp_name, 'n': len(sub),
+                    'test_R2': r2_score(ys.iloc[te], m.predict(Xs.iloc[te])),
+                    'test_MAE': mean_absolute_error(ys.iloc[te], m.predict(Xs.iloc[te])),
+                    'cv50_R2_mean': r2m, 'cv50_R2_sd': r2s, 'cv50_R2_CI': f'{r2lo:.3f}-{r2hi:.3f}'})
+log('\n--- 3) 物种特异性模型（各物种独立, 80/20 + 50 seeds 5折CV）---')
+log(pd.DataFrame(sp_rows).round(3).to_string(index=False))
+pd.DataFrame(sp_rows).to_csv(os.path.join(HERE, 'results_species_specific_final.csv'), index=False)
+
+# ------------------------------------------------------------------ 4) 分组 CV（pooled 口径）
+df['SpPlastic'] = df['SpeciesName'] + '_' + df['Plastic']
+
+def grouped_pooled(feats, group_key, name):
+    rows, preds_all, y_all = [], [], []
+    for g in df[group_key].unique():
+        te_g = df[group_key] == g
+        m = rf().fit(df.loc[~te_g, feats], df.loc[~te_g, 'Inhibition_pct'])
+        p = m.predict(df.loc[te_g, feats])
+        rows.append({'group': g, 'R2': r2_score(df.loc[te_g, 'Inhibition_pct'], p),
+                     'MAE': mean_absolute_error(df.loc[te_g, 'Inhibition_pct'], p), 'n': int(te_g.sum())})
+        preds_all.extend(p); y_all.extend(df.loc[te_g, 'Inhibition_pct'])
+    return {'cv': name, 'pooled_R2': r2_score(y_all, preds_all), 'pooled_MAE': mean_absolute_error(y_all, preds_all),
+            'per_group': rows}
+
+gcv_rows = []
+for feats, input_name in [(BASE_FEATS, 'Fold-EC50'), (RAW_FEATS, 'raw')]:
+    for key, cname in [('Plastic', 'LOPTO'), ('SpPlastic', 'LOSeries(species x plastic, 12folds)'), ('Species', 'LOSO')]:
+        r = grouped_pooled(feats, key, f'{cname}[{input_name}]')
+        gcv_rows.append(r)
+# 增强模型 LOSO
+r_enh_loso = grouped_pooled(ENH_FEATS, 'Species', 'LOSO[enhanced]')
+gcv_rows.append(r_enh_loso)
+
+log('\n--- 4) 分组 CV（pooled R² / MAE, 逐组明细）---')
+for r in gcv_rows:
+    log(f"{r['cv']}: pooled R²={r['pooled_R2']:.3f}, MAE={r['pooled_MAE']:.3f}")
+    log('    ' + str([{k: (round(v, 3) if isinstance(v, float) else v) for k, v in g.items()} for g in r['per_group']]))
+pd.DataFrame([{k: (str(v) if k == 'per_group' else round(v, 3) if isinstance(v, float) else v) for k, v in r.items()} for r in gcv_rows]).to_csv(
+    os.path.join(HERE, 'si_table_S11_grouped_cv_pooled.csv'), index=False)
+
+# ------------------------------------------------------------------ 5) 泄漏诊断
+leak_rows = []
+for feats, name in [(df[['Fold_EC50']], 'Fold_EC50_only'), (df[['Concentration_mgL']], 'RawConcentration_only')]:
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RS)
+    r2s = []
+    for a, b in skf.split(feats, df['Species']):
+        m = rf().fit(feats.iloc[a], y.iloc[a])
+        r2s.append(r2_score(y.iloc[b], m.predict(feats.iloc[b])))
+    leak_rows.append({'feature': name, 'cv_R2_mean': np.mean(r2s), 'cv_R2_sd': np.std(r2s)})
+log('\n--- 5) 泄漏诊断（5 折 CV 单特征）---')
+log(pd.DataFrame(leak_rows).round(4).to_string(index=False))
+pd.DataFrame(leak_rows).to_csv(os.path.join(HERE, 'results_leakage_final.csv'), index=False)
+
+# ------------------------------------------------------------------ 6) 预测区间（LOSeries 下, 1000 树 RF 分位数）
+pi_rows = []
+for feats, input_name in [(BASE_FEATS, 'Fold-EC50'), (ENH_FEATS, 'enhanced')]:
+    cover, widths = [], []
+    for g in df['SpPlastic'].unique():
+        te_g = df['SpPlastic'] == g
+        m = RandomForestRegressor(n_estimators=1000, max_depth=8, random_state=RS).fit(df.loc[~te_g, feats], df.loc[~te_g, 'Inhibition_pct'])
+        Xte_g = df.loc[te_g, feats]
+        preds = np.array([t.predict(Xte_g) for t in m.estimators_])
+        lo = np.percentile(preds, 2.5, axis=0); hi = np.percentile(preds, 97.5, axis=0)
+        yv = df.loc[te_g, 'Inhibition_pct'].values
+        cover.extend(((yv >= lo) & (yv <= hi)).tolist()); widths.extend((hi - lo).tolist())
+    pi_rows.append({'input': input_name, 'n_heldout': len(cover), 'coverage_95pct': np.mean(cover),
+                    'mean_width_pct': np.mean(widths)})
+log('\n--- 6) 预测区间（LOSeries 12 折下, 1000 树 RF 2.5-97.5 分位）---')
+log(pd.DataFrame(pi_rows).round(3).to_string(index=False))
+pd.DataFrame(pi_rows).to_csv(os.path.join(HERE, 'si_table_S10_prediction_intervals_final.csv'), index=False)
+
+# ------------------------------------------------------------------ 7) EC20（全局基线模型, 300 对数浓度点插值）
+ec20_rows = []
+m_global = rf().fit(Xtr[BASE_FEATS], ytr)
+for sp_name, sp_code, t_sel in [('C.vulgaris', 0, 72), ('D.magna', 1, 48)]:
+    for mat in ['PS', 'PVC', 'PE']:
+        msub = df[(df['Species'] == sp_code) & (df['Plastic'] == mat) & (df['Time_h'] == t_sel)]
+        cmin = msub.loc[msub['Concentration_mgL'] > 0, 'Concentration_mgL'].min()
+        concs = np.logspace(np.log10(cmin), np.log10(msub['Concentration_mgL'].max()), 300)
+        pred_df = pd.DataFrame({'Fold_EC50': concs / EC50_D[sp_name][mat], 'Size_um': msub['Size_um'].iloc[0],
+                                'SurfaceGroup': msub['SurfaceGroup'].iloc[0], 'Time_h': t_sel, 'Species': sp_code})
+        pred = m_global.predict(pred_df[BASE_FEATS])
+        ec20_pred = None
+        for i in range(1, len(pred)):
+            if pred[i] >= 20:
+                ec20_pred = concs[i-1] + (20 - pred[i-1]) / (pred[i] - pred[i-1]) * (concs[i] - concs[i-1])
+                break
+        # 实测 EC20（浓度-抑制对插值）
+        ord_idx = np.argsort(msub['Concentration_mgL'].values)
+        xm = msub['Concentration_mgL'].values[ord_idx]; ym = msub['Inhibition_pct'].values[ord_idx]
+        ec20_meas = None
+        for i in range(1, len(ym)):
+            if ym[i] >= 20:
+                ec20_meas = xm[i-1] + (20 - ym[i-1]) / (ym[i] - ym[i-1]) * (xm[i] - xm[i-1])
+                break
+        rel = (ec20_pred - ec20_meas) / ec20_meas * 100 if (ec20_pred is not None and ec20_meas is not None) else None
+        ec20_rows.append({'species': sp_name, 'plastic': mat, 'time_h': t_sel, 'EC20_meas_mgL': ec20_meas,
+                          'EC20_pred_mgL': ec20_pred,
+                          'rel_dev_pct': rel,
+                          'flag': 'interpolated' if ec20_meas is not None else 'extrapolated (no measured point >=20%)'})
+log('\n--- 7) EC20（全局基线模型预测 vs 实测插值）---')
+log(pd.DataFrame(ec20_rows).round(3).to_string(index=False))
+pd.DataFrame(ec20_rows).to_csv(os.path.join(HERE, 'si_table_S12_ec20_flags.csv'), index=False)
+
+# ------------------------------------------------------------------ 8) SHAP 重要性 + Size-SHAP 决策树
+try:
+    import shap
+    log('\n--- 8) SHAP 重要性（mean|SHAP|, 训练集）---')
+    for name, m, feats in [('baseline', m_base, BASE_FEATS), ('enhanced', m_enh, ENH_FEATS)]:
+        expl = shap.TreeExplainer(m)
+        sv = expl.shap_values(Xtr[feats])
+        imp = pd.Series(np.abs(sv).mean(axis=0), index=feats).sort_values(ascending=False)
+        log(f'[{name}]')
+        for k, v in imp.items():
+            log(f'  {k:15s} {v:.4f}')
+        imp.to_csv(os.path.join(HERE, f'si_shap_importance_{name}.csv'))
+    # Size-SHAP 决策树切分
+    expl_b = shap.TreeExplainer(m_base)
+    sv_b = expl_b.shap_values(Xtr[BASE_FEATS])
+    size_shap = pd.DataFrame({'Size_um': Xtr['Size_um'], 'shap': sv_b[:, 1]})
+    tree = DecisionTreeRegressor(max_depth=2, random_state=RS).fit(size_shap[['Size_um']], size_shap['shap'])
+    log('\n--- Size-SHAP 决策树切分（基线模型）---')
+    tree_ = tree.tree_
+    n_nodes = tree_.node_count
+    children_left, children_right = tree_.children_left, tree_.children_right
+    feature, threshold = tree_.feature, tree_.threshold
+    node_depth = np.zeros(n_nodes, dtype=int); is_leaves = np.zeros(n_nodes, bool)
+    stack = [0]
+    while stack:
+        node_id = stack.pop()
+        if children_left[node_id] != children_right[node_id]:
+            stack.append(children_left[node_id]); stack.append(children_right[node_id])
+            node_depth[children_left[node_id]] = node_depth[node_id] + 1
+            node_depth[children_right[node_id]] = node_depth[node_id] + 1
+        else:
+            is_leaves[node_id] = True
+    for i in range(n_nodes):
+        if not is_leaves[i]:
+            log(f'  节点深度{node_depth[i]}: Size_um <= {threshold[i]:.3f} µm (n={tree_.n_node_samples[i]})')
+except ImportError:
+    log('\n--- 8) SHAP 未安装, 跳过（pip install shap）---')
+
+# ------------------------------------------------------------------ 汇总写盘
+out = '\n'.join(L)
+with open(os.path.join(HERE, 'model_results_final.txt'), 'w', encoding='utf-8') as f:
+    f.write(out)
+print(out)
+print('\n[完成] 全部结果已写入 model_results_final.txt 及各 csv')

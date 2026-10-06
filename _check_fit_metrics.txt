@@ -1,0 +1,62 @@
+# -*- coding: utf-8 -*-
+"""临时核对脚本：用最终基线模型重算 Fig.8/Table S8 的拟合 R²、MAE、EC20 rel_dev"""
+import os, numpy as np, pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import r2_score, mean_absolute_error
+
+HERE = r"C:\Users\fanyuan\Doubao\chats\2026-09-09\new-chat\zaosao daima-zhong"
+CSV = os.path.join(HERE, "SI_Dataset_unified.csv")
+RS = 42
+BASE_FEATS = ['Fold_EC50', 'Size_um', 'SurfaceGroup', 'Time_h', 'Species']
+EC50_D = {
+    'C.vulgaris': {'PS-NH2': 120.3, 'PS-COOH': 733.4, 'PS': 198.0, 'PE': 1309.9, 'PP': 1395.7, 'PVC': 972.6},
+    'D.magna':   {'PS-NH2': 21.6,  'PS-COOH': 24.2,  'PS': 23.1,  'PE': 155.5,  'PP': 179.8,  'PVC': 127.7},
+}
+def rf(seed=RS):
+    return RandomForestRegressor(n_estimators=200, max_depth=8, random_state=seed)
+
+df = pd.read_csv(CSV)
+y = df['Inhibition_pct']
+sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=RS)
+tr_idx, te_idx = next(sss.split(df, df['Species']))
+m_global = rf().fit(df.iloc[tr_idx][BASE_FEATS], y.iloc[tr_idx])
+
+rows = []
+for sp_name, sp_code, t_sel in [('C.vulgaris', 0, 72), ('D.magna', 1, 48)]:
+    for mat in ['PS', 'PVC', 'PE']:
+        msub = df[(df['Species'] == sp_code) & (df['Plastic'] == mat) & (df['Time_h'] == t_sel)]
+        Xm = msub[BASE_FEATS]
+        ym = msub['Inhibition_pct'].values
+        pm = m_global.predict(Xm)
+        r2 = r2_score(ym, pm)
+        mae = mean_absolute_error(ym, pm)
+        # EC20 pred（300 对数点）
+        cmin = msub.loc[msub['Concentration_mgL'] > 0, 'Concentration_mgL'].min()
+        concs = np.logspace(np.log10(cmin), np.log10(msub['Concentration_mgL'].max()), 300)
+        psub = pd.DataFrame({'Fold_EC50': concs / EC50_D[sp_name][mat],
+                             'Size_um': msub['Size_um'].iloc[0],
+                             'SurfaceGroup': msub['SurfaceGroup'].iloc[0],
+                             'Time_h': t_sel, 'Species': sp_code})
+        pred = m_global.predict(psub[BASE_FEATS])
+        ec20_pred = None
+        for i in range(1, len(pred)):
+            if pred[i] >= 20:
+                ec20_pred = concs[i-1] + (20 - pred[i-1]) / (pred[i] - pred[i-1]) * (concs[i] - concs[i-1])
+                break
+        # 实测 EC20
+        ord_idx = np.argsort(msub['Concentration_mgL'].values)
+        xm = msub['Concentration_mgL'].values[ord_idx]; ym2 = ym[ord_idx]
+        ec20_meas = None
+        for i in range(1, len(ym2)):
+            if ym2[i] >= 20:
+                ec20_meas = xm[i-1] + (20 - ym2[i-1]) / (ym2[i] - ym2[i-1]) * (xm[i] - xm[i-1])
+                break
+        rel = (ec20_pred - ec20_meas) / ec20_meas * 100 if (ec20_pred is not None and ec20_meas is not None) else None
+        rows.append({'species': sp_name, 'plastic': mat, 'time_h': t_sel, 'n': len(msub),
+                     'fit_R2': r2, 'fit_MAE': mae,
+                     'EC20_meas_mgL': ec20_meas, 'EC20_pred_mgL': ec20_pred, 'rel_dev_pct': rel})
+
+out = pd.DataFrame(rows).round(3)
+print(out.to_string(index=False))
+out.to_csv(os.path.join(HERE, '_check_fit_metrics.csv'), index=False)
